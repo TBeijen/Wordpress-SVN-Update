@@ -4,6 +4,18 @@
  *
  * Class that will find most recent version of wordpress and installed
  * plugins, switch to must recent versions and update using svn.
+ *
+ * TODO/ideas:
+ *  - support more complex svn externals notation like 'folder -r 123 url'
+ *  - display feedback while collecting info
+ *  - write log, or save backup file holding previous version, offering rollback
+ *  - ...
+ *
+ * Copyright (c) 2011 Tibo Beijen
+ *
+ * Dual licensed under the MIT and GPL licenses:
+ *   http://www.opensource.org/licenses/mit-license.php
+ *   http://www.gnu.org/licenses/gpl.html
  */
 class WordpressSvnUpdate
 {
@@ -44,6 +56,18 @@ class WordpressSvnUpdate
     protected $_wpUrlCurrent;
 
     /**
+     * Array holding svnupdate info and the command to execute
+     * @var array
+     */
+    protected $_updateInfoWp;
+
+    /**
+     * Array holding info of plugin externals that will possibly be updated
+     * @var array
+     */
+    protected $_updateInfoPlugins;
+
+    /**
      * Will parse options and run update
      */
     public function runCli()
@@ -61,6 +85,13 @@ class WordpressSvnUpdate
         if ($this->_hasError) {
             $this->_exit();
         }
+
+        // collect update info
+        $this->_determineWpSwitchCommand();
+        $this->_determinePluginUpdates();
+
+        // print info and execute
+        $this->_exec();
     }
 
     /**
@@ -148,6 +179,207 @@ class WordpressSvnUpdate
             $this->_showError('Cannot parse svn repository info');
             $this->_hasError = true;
         }
+    }
+
+    /**
+     * Will determine command to execute for updating wordpress
+     * and store the info in $this->_updateInfoWp
+     */
+    protected function _determineWpSwitchCommand()
+    {
+        $updateInfo = $this->_svnFindNewest($this->_wpUrlCurrent);
+        $cmd = null;
+        if ($updateInfo['isUpdate']) {
+            $cmd = 'svn sw ' . $updateInfo['newUrl'];
+        }
+        $updateInfo['cmd'] = $cmd;
+
+        $this->_updateInfoWp = $updateInfo;
+    }
+
+
+    /**
+     * Will gather update info of plugin externals
+     * and store the info in $this->_updateInfoPlugins
+     */
+    protected function _determinePluginUpdates()
+    {
+        $cmd = 'svn propget svn:externals wp-content/plugins';
+        exec($cmd, $currentExternals);
+
+        $this->_updateInfoPlugins = array();
+        foreach ($currentExternals as $external) {
+            if (trim($external) == '') {
+                continue;
+            }
+            $parts = explode(' ', $external);
+            $name = $parts[0];
+            $currentUrl = $parts[1];
+
+            $externalInfo = $this->_svnFindNewest($currentUrl, true);
+            $this->_updateInfoPlugins[$name] = $externalInfo;
+        }
+    }
+
+    /**
+     * Execute gathered changes
+     */
+    protected function _exec()
+    {
+        $wpUpdate = false;
+        echo 'Changes to be performed' . PHP_EOL;
+        echo '=======================' . PHP_EOL;
+
+        // Wordpress svn switch
+        echo "Wordpress:" . PHP_EOL;
+
+        if ($this->_updateInfoWp['isUpdate']) {
+            printf("\t%s -> %s%s", $this->_updateCommandWp['currentVersion'],
+                $this->_updateInfoWp['newVersion'], PHP_EOL);
+            $wpUpdate = true;
+        } else {
+            echo "\t" . 'No change, current version = ' .
+                $this->_updateInfoWp['currentVersion'] . ')' . PHP_EOL;
+        }
+
+        // Externals to be updated
+        $newExternalsContent = '';
+        $externalsUpdate = false;
+
+        echo "Plugins (externals):" . PHP_EOL;
+        foreach ($this->_updateInfoPlugins as $name => $info) {
+            if ($info['isUpdate']) {
+                printf("\t%s: %s -> %s%s", $name, $info['currentVersion'],
+                    $info['newVersion'], PHP_EOL);
+                $externalsUpdate = true;
+            } else {
+                printf("\t%s: No change, current version = %s%s",
+                    $name, $info['currentVersion'], PHP_EOL);
+            }
+            $newExternalsContent .= $name . ' ' . $info['newUrl'] . PHP_EOL;
+        }
+
+        // ask for confirmation if no -f switch
+        if (!$this->_optForce && ($wpUpdate || $externalsUpdate)) {
+            echo PHP_EOL;
+
+            while (true) {
+                echo 'Type "y" to confirm' . PHP_EOL;
+                $answer = $this->_askUserInput();
+                if (strtolower($answer) == 'y') {
+                    break;
+                }
+            }
+        }
+
+        // unless no externals
+        if ($externalsUpdate) {
+            // create temp. file holding new externals data
+            $tmpFile = tempnam(sys_get_temp_dir(), 'wp-svn-update-');
+            file_put_contents($tmpFile, $newExternalsContent);
+            $cmd = 'svn propset svn:externals wp-content/plugins -F ' . $tmpFile;
+            passthru($cmd);
+
+            // remove temp. file
+            unlink($tmpFile);
+        }
+
+        // exec wp switch command, or svn update to update externals
+        if ($wpUpdate) {
+            passthru($this->_updateInfoWp['cmd']);
+        } elseif ($externalsUpdate) {
+            $cmd = 'svn up';
+            passthru($cmd);
+        }
+
+        $this->_exit();
+    }
+
+
+    /**
+     * Parses currentUrl and returns array holding keys:
+     *   currentUrl
+     *   currentVersion
+     *   newUrl
+     *   newVersion
+     *   isUpdate
+     *   isParseError
+     * @param string $currentUrl
+     * @param boolean $isPlugin
+     * @return array
+     */
+    protected function _svnFindNewest($currentUrl, $isPlugin = false)
+    {
+        $pluginPatternPart = ($isPlugin) ? '\/.+?' : '';
+
+        // current url can be either trunk or tag
+        $patternTrunk = '/http.+?' . $pluginPatternPart . '\/trunk\/?/';
+        $matchCountTrunk = preg_match($patternTrunk, $currentUrl, $matchesTrunk);
+
+        if ($matchCountTrunk) {
+            $return = array(
+                'currentUrl' => $currentUrl,
+                'currentVersion' => 'trunk',
+                'newUrl' => $currentUrl,
+                'newVersion' => 'trunk',
+                'isUpdate' => true,
+                'isParseError' => false
+            );
+            return $return;
+        }
+
+        // determine current version (tag) and retrieve newest
+        $patternTag = '/http.+?' . $pluginPatternPart . '\/tags\/(.+\/?)$/';
+        $matchCountTag = preg_match($patternTag, $currentUrl, $matchesTag);
+        
+        if ($matchCountTag) {
+            $baseUrl = str_replace($matchesTag[1], '', $matchesTag[0]);
+            $cmd = 'svn ls ' . $baseUrl;
+            $listOutput = shell_exec($cmd);
+            $listLines = explode("\n", trim($listOutput));
+            
+            $currentVersion = trim($matchesTag[1], '/');
+            $newVersion = trim(array_pop($listLines), '/');
+            $newUrl = $baseUrl . $newVersion . '/';
+            $isUpdate = (version_compare($newVersion, $currentVersion) == 1);
+
+            $return = array(
+                'currentUrl' => $currentUrl,
+                'currentVersion' => $currentVersion,
+                'newUrl' => $newUrl,
+                'newVersion' => $newVersion,
+                'isUpdate' => $isUpdate,
+                'isParseError' => false
+            );
+            return $return;
+        }
+
+        // not finding trunk or tag -> error
+        $this->_showError('Cannot determine newest version of current svn url: ' . $currentUrl);
+
+        // return array stating error
+        $return = array(
+            'currentUrl' => $currentUrl,
+            'currentVersion' => null,
+            'newUrl' => $currentUrl,
+            'newVersion' => null,
+            'isUpdate' => false,
+            'isParseError' => true
+        );
+        return $return;
+    }
+
+    /**
+     * Waits for user input and returns entered value
+     * @return string
+     */
+    protected function _askUserInput()
+    {
+        $in = fopen('php://stdin', 'r');
+        $answer = trim(fgets($in));
+        fclose($in);
+
+        return $answer;
     }
 }
 
