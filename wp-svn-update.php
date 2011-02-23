@@ -6,7 +6,6 @@
  * plugins, switch to must recent versions and update using svn.
  *
  * TODO/ideas:
- *  - support more complex svn externals notation like 'folder -r 123 url'
  *  - display feedback while collecting info
  *  - write log, or save backup file holding previous version, offering rollback
  *  - ...
@@ -87,8 +86,8 @@ class WordpressSvnUpdate
         }
 
         // collect update info
-        $this->_determineWpSwitchCommand();
-        $this->_determinePluginUpdates();
+        $this->_configureWpSwitchCommand();
+        $this->_configurePluginUpdates();
 
         // print info and execute
         $this->_exec();
@@ -185,7 +184,7 @@ class WordpressSvnUpdate
      * Will determine command to execute for updating wordpress
      * and store the info in $this->_updateInfoWp
      */
-    protected function _determineWpSwitchCommand()
+    protected function _configureWpSwitchCommand()
     {
         $updateInfo = $this->_svnFindNewest($this->_wpUrlCurrent);
         $cmd = null;
@@ -202,7 +201,7 @@ class WordpressSvnUpdate
      * Will gather update info of plugin externals
      * and store the info in $this->_updateInfoPlugins
      */
-    protected function _determinePluginUpdates()
+    protected function _configurePluginUpdates()
     {
         $cmd = 'svn propget svn:externals wp-content/plugins';
         exec($cmd, $currentExternals);
@@ -212,11 +211,26 @@ class WordpressSvnUpdate
             if (trim($external) == '') {
                 continue;
             }
-            $parts = explode(' ', $external);
-            $name = $parts[0];
-            $currentUrl = $parts[1];
 
+            $pattern = '/(.+?)(\s+\-r\s*\d+)?\s+(.*)$/i';
+            $matchCount = preg_match($pattern, $external, $matches);
+
+            // extract name, url and optional revision from line
+            $name = $matches[1];
+            $revision = trim($matches[2]);
+            $currentUrl = $matches[3];
+            
+            // fetch info about available externals
             $externalInfo = $this->_svnFindNewest($currentUrl, true);
+
+            // construct line for new externals config
+            $newExternalsLine = sprintf('%s%s %s', $name, $matches[2],
+                $externalInfo['newUrl']);
+
+            // add additional info to retrieved external info
+            $externalInfo['revision'] = $revision;
+            $externalInfo['newExternalsLine'] = $newExternalsLine;
+
             $this->_updateInfoPlugins[$name] = $externalInfo;
         }
     }
@@ -234,7 +248,7 @@ class WordpressSvnUpdate
         echo "Wordpress:" . PHP_EOL;
 
         if ($this->_updateInfoWp['isUpdate']) {
-            printf("\t%s -> %s%s", $this->_updateCommandWp['currentVersion'],
+            printf("\t%s -> %s%s", $this->_updateInfoWp['currentVersion'],
                 $this->_updateInfoWp['newVersion'], PHP_EOL);
             $wpUpdate = true;
         } else {
@@ -248,15 +262,15 @@ class WordpressSvnUpdate
 
         echo "Plugins (externals):" . PHP_EOL;
         foreach ($this->_updateInfoPlugins as $name => $info) {
-            if ($info['isUpdate']) {
+            if ($info['isUpdate'] && !trim($info['revision'])) {
                 printf("\t%s: %s -> %s%s", $name, $info['currentVersion'],
                     $info['newVersion'], PHP_EOL);
                 $externalsUpdate = true;
             } else {
-                printf("\t%s: No change, current version = %s%s",
-                    $name, $info['currentVersion'], PHP_EOL);
+                printf("\t%s: No change, current version = %s %s%s",
+                    $name, $info['currentVersion'], $info['revision'], PHP_EOL);
             }
-            $newExternalsContent .= $name . ' ' . $info['newUrl'] . PHP_EOL;
+            $newExternalsContent .= $info['newExternalsLine'] . PHP_EOL;
         }
 
         // ask for confirmation if no -f switch
@@ -294,7 +308,6 @@ class WordpressSvnUpdate
 
         $this->_exit();
     }
-
 
     /**
      * Parses currentUrl and returns array holding keys:
