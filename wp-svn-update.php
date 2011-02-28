@@ -6,7 +6,8 @@
  * plugins, switch to must recent versions and update using svn.
  *
  * TODO/ideas:
- *  - display feedback while collecting info
+ *  - create backup
+ *  - Always use externals versions as configured in wordpress externals setting
  *  - write log, or save backup file holding previous version, offering rollback
  *  - ...
  *
@@ -65,6 +66,12 @@ class WordpressSvnUpdate
      * @var array
      */
     protected $_updateInfoPlugins;
+
+    /**
+     * Will hold backup commands that will be executed prior to wp update
+     * @var array
+     */
+    protected $_backupCommands = array();
 
     /**
      * Will parse options and run update
@@ -186,6 +193,8 @@ class WordpressSvnUpdate
      */
     protected function _configureWpSwitchCommand()
     {
+        echo 'Looking up wordpress available versions...' . PHP_EOL;
+        
         $updateInfo = $this->_svnFindNewest($this->_wpUrlCurrent);
         $cmd = null;
         if ($updateInfo['isUpdate']) {
@@ -203,6 +212,8 @@ class WordpressSvnUpdate
      */
     protected function _configurePluginUpdates()
     {
+        echo 'Looking up plugins available versions...' . PHP_EOL;
+
         $cmd = 'svn propget svn:externals wp-content/plugins';
         exec($cmd, $currentExternals);
 
@@ -221,6 +232,7 @@ class WordpressSvnUpdate
             $currentUrl = $matches[3];
             
             // fetch info about available externals
+            echo "\t" . $name . PHP_EOL;
             $externalInfo = $this->_svnFindNewest($currentUrl, true);
 
             // construct line for new externals config
@@ -235,6 +247,49 @@ class WordpressSvnUpdate
         }
     }
 
+    /**
+     * Will define backup commands to be executed.
+     * (Config file will be parsed, not included because it in turn would
+     * otherwise include massive amounts of unneeded wordpress code)
+     */
+    protected function _configureBackup()
+    {
+        // array holding empty vars, to be filled with vars extracted from config
+        $dbInfo = array(
+            'DB_NAME' => '',
+            'DB_USER' => '',
+            'DB_PASSWORD' => '',
+            'DB_HOST' => '',
+        );
+
+        $configContents = file_get_contents($this->_targetAbsolute . '/wp-config.php');
+        $pattern = '/(DB_\w+)[\'"][,\s]+[\'"](.*?)[\'"]/';
+        preg_match_all($pattern, $configContents, $matchesarray);
+
+        // extract vars
+        $keys = $matchesarray[1];
+        $values = $matchesarray[2];
+        for ($i = 0; $i < count($keys); $i++) {
+            $dbInfo[$keys[$i]] = $values[$i];
+        }
+
+        $backupId = sprintf('%s-%s@%s', strftime('%Y%m%d_%H%M%S'),
+            $dbInfo['DB_NAME'], $dbInfo['DB_HOST']);
+
+        // file backup
+        $cmd =  sprintf('tar -czf ~/%s.tar.gz %s', $backupId, '.');
+        $this->_backupCommands[] = $cmd;
+
+        // sql backup
+        $this->_backupCommands[] = sprintf('mysqldump --host=%s --user=%s --password=%s %s > ~/%s.sql',
+            $dbInfo['DB_HOST'],
+            $dbInfo['DB_USER'],
+            $dbInfo['DB_PASSWORD'],
+            $dbInfo['DB_NAME'],
+            $backupId
+        );
+    }
+    
     /**
      * Execute gathered changes
      */
@@ -273,6 +328,15 @@ class WordpressSvnUpdate
             $newExternalsContent .= $info['newExternalsLine'] . PHP_EOL;
         }
 
+        // if something will be changed, prepare backup commands
+        if ($wpUpdate || $externalsUpdate) {
+            echo "Backup commands:" . PHP_EOL;
+            $this->_configureBackup();
+            foreach ($this->_backupCommands as $buCmd) {
+                echo "\t" . $buCmd . PHP_EOL;
+            }
+        }
+
         // ask for confirmation if no -f switch
         if (!$this->_optForce && ($wpUpdate || $externalsUpdate)) {
             echo PHP_EOL;
@@ -284,6 +348,11 @@ class WordpressSvnUpdate
                     break;
                 }
             }
+        }
+
+        // backup
+        foreach ($this->_backupCommands as $buCmd) {
+            passthru($buCmd);
         }
 
         // unless no externals
@@ -301,6 +370,11 @@ class WordpressSvnUpdate
         // exec wp switch command, or svn update to update externals
         if ($wpUpdate) {
             passthru($this->_updateInfoWp['cmd']);
+
+            // run update after switch to prevent plugins being nuked due to
+            // possible externals merge conflict.
+            $cmd = 'svn up';
+            passthru($cmd);
         } elseif ($externalsUpdate) {
             $cmd = 'svn up';
             passthru($cmd);
